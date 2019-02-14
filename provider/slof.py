@@ -17,76 +17,145 @@ import time
 import logging
 import os
 
+from collections import defaultdict
 from virttest import utils_misc
 
 
-def get_boot_content(vm, start_pos=0, start_str='SLOF',
-                     end_str='Successfully loaded'):
-    """
-    Get the specified content of SLOF by reading the serial log.
+# def get_boot_content(vm, start_pos=0, start_str='SLOF',
+#                      end_str='Successfully loaded'):
+#     """
+#     Get the specified content of SLOF by reading the serial log.
+#
+#     :param vm: VM object
+#     :param start_pos: start position which start to read
+#     :type start_pos: int
+#     :param start_str: start string
+#     :type start_str: int
+#     :param end_str: end string
+#     :type end_str: str
+#     :return: content list and next position
+#     :rtype: tuple(list, int)
+#     """
+#     content = []
+#     with open(vm.serial_console_log) as fd:
+#         for pos, line in enumerate(fd):
+#             if pos >= start_pos:
+#                 if start_str in line:
+#                     content.append(line)
+#                 elif end_str in line:
+#                     content.append(line)
+#                     return content, pos + 1
+#                 elif content:
+#                     content.append(line)
+#             else:
+#                 continue
+#         else:
+#             # Reference variable 'pos' to '-1' if the serial console log is
+#             # empty.
+#             pos = -1
+#     return None, pos + 1
+#
+#
+# def wait_for_loaded(vm, test, start_pos=0, start_str='SLOF',
+#                     end_str='Successfully loaded', timeout=300):
+#     """
+#     Wait for loading the SLOF.
+#
+#     :param vm: VM object
+#     :param test: kvm test object
+#     :param start_pos: start position which start to read
+#     :type start_pos: int
+#     :param start_str: start string
+#     :type start_str: int
+#     :param end_str: end string
+#     :type end_str: str
+#     :param timeout: time out for waiting
+#     :type timeout: float
+#     :return: content list and next position
+#     :rtype: tuple(list, int)
+#     """
+#     file_timeout = 30
+#     if not utils_misc.wait_for(lambda: os.path.isfile(vm.serial_console_log),
+#                                file_timeout):
+#         test.error('No found serial log in %s sec.' % file_timeout)
+#
+#     end_time = float(timeout) + time.time()
+#     while time.time() < end_time:
+#         content, cur_pos = get_boot_content(vm, start_pos, start_str, end_str)
+#         if content:
+#             logging.info('Output of SLOF:\n%s' % ''.join(content))
+#             return content, cur_pos
+#     test.fail(
+#         'No found corresponding SLOF info in serial log during %s sec.' %
+#         timeout)
 
-    :param vm: VM object
-    :param start_pos: start position which start to read
-    :type start_pos: int
-    :param start_str: start string
-    :type start_str: int
-    :param end_str: end string
-    :type end_str: str
-    :return: content list and next position
-    :rtype: tuple(list, int)
-    """
+class CrTimeOutError(Exception):
+    def __init__(self, crname, timeout):
+        super(CrTimeOutError, self).__init__(
+            "%d timeout in %s" % (crname, timeout)
+            )
+        self.crname = crname
+        self.timeout = timeout
+
+
+def coroutine(func):
+    def start(*args, **kargs):
+        cr = func(*args, **kargs)
+        cr.send(None)
+        return cr
+    return start
+
+
+@coroutine
+def follow(filename, target, timeout=10):
+    with open(filename, "r") as fd:
+        start = time.time()
+        while True:
+            line = fd.readline()
+            if line:
+                target.send(line)
+                start = time.time()
+            elif time.time() >= start + timeout:
+                raise CrTimeOutError("follow", timeout)
+
+
+@coroutine
+def grep(prefix, suffix, target, timeout=10):
     content = []
-    with open(vm.serial_console_log) as fd:
-        for pos, line in enumerate(fd):
-            if pos >= start_pos:
-                if start_str in line:
-                    content.append(line)
-                elif end_str in line:
-                    content.append(line)
-                    return content, pos + 1
-                elif content:
-                    content.append(line)
-            else:
-                continue
-        else:
-            # Reference variable 'pos' to '-1' if the serial console log is
-            # empty.
-            pos = -1
-    return None, pos + 1
-
-
-def wait_for_loaded(vm, test, start_pos=0, start_str='SLOF',
-                    end_str='Successfully loaded', timeout=300):
-    """
-    Wait for loading the SLOF.
-
-    :param vm: VM object
-    :param test: kvm test object
-    :param start_pos: start position which start to read
-    :type start_pos: int
-    :param start_str: start string
-    :type start_str: int
-    :param end_str: end string
-    :type end_str: str
-    :param timeout: time out for waiting
-    :type timeout: float
-    :return: content list and next position
-    :rtype: tuple(list, int)
-    """
-    file_timeout = 30
-    if not utils_misc.wait_for(lambda: os.path.isfile(vm.serial_console_log),
-                               file_timeout):
-        test.error('No found serial log in %s sec.' % file_timeout)
-
-    end_time = float(timeout) + time.time()
-    while time.time() < end_time:
-        content, cur_pos = get_boot_content(vm, start_pos, start_str, end_str)
+    start = time.time()
+    while True:
+        line = yield
         if content:
-            logging.info('Output of SLOF:\n%s' % ''.join(content))
-            return content, cur_pos
-    test.fail(
-        'No found corresponding SLOF info in serial log during %s sec.' %
-        timeout)
+            content.append(line)
+            if suffix in line:
+                target.send(content)
+                content.clear()
+                start = time.time()
+        if time.time() >= start + timeout:
+            raise CrTimeOutError("grep", timeout)
+        if prefix in line:
+            content.append(line)
+    else:
+        raise RuntimeError("Timeout in grep")
+
+
+content_cache = defaultdict(list)
+
+
+@coroutine
+def collector(id):
+    while True:
+        content = yield
+        content_cache[id].append(content)
+
+
+def get_boot_content(vm, start_pos=0, prefix='SLOF',
+                     suffix='Successfully loaded', timeout=10):
+    id = vm.name + prefix + suffix
+    follow(vm.serial_console_log,
+           grep(prefix, suffix, collector(id), timeout=timeout),
+           timeout=timeout)
+    return content_cache[id][0]
 
 
 def get_booted_devices(content):
