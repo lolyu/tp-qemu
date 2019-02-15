@@ -84,7 +84,11 @@ def run(test, params, env):
 
     vm = env.get_vm(params['main_vm'])
     vm.verify_alive()
-    content, _ = slof.wait_for_loaded(vm, test)
+    reader = slof.SerialLogReader(vm)
+    reader.start()
+    content_gen = slof.get_boot_content()
+
+    content = next(content_gen)
 
     error_context.context("Check the output of SLOF.", logging.info)
     slof.check_error(test, content)
@@ -106,4 +110,5 @@ def run(test, params, env):
     logging.info("Ping host(%s) successfully." % extra_host_ip)
 
     session.close()
+    reader.join()
     vm.destroy(gracefully=True)

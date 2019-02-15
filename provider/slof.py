@@ -15,76 +15,80 @@ Available functions:
 import re
 import time
 import logging
+import threading
+import socket
+import queue
+import select
 import os
 
-from virttest import utils_misc
+
+class PollableQueue(queue.Queue):
+    def __init__(self, name):
+        super(PollableQueue, self).__init__()
+        self.name = name
+        self._put_socket, self._get_socket = socket.socketpair()
+
+    def fileno(self):
+        return self._get_socket.fileno()
+
+    def put(self, item):
+        super(PollableQueue, self).put(item)
+        self._put_socket.send(b"i")
+
+    def get(self):
+        self._get_socket.recv(1)
+        return super(PollableQueue, self).get()
 
 
-def get_boot_content(vm, start_pos=0, start_str='SLOF',
-                     end_str='Successfully loaded'):
-    """
-    Get the specified content of SLOF by reading the serial log.
+class SerialLogReader(threading.Thread):
+    def __init__(self, vm, prefix="SLOF", suffix="Successfully loaded"):
+        super(SerialLogReader, self).__init__(name=vm.name, group=None,
+                                              target=None)
+        self.filename = vm.serial_console_log
+        self.prefix = prefix
+        self.suffix = suffix
+        self._stop_event = threading.Event()
+        self.queue = PollableQueue(vm.name)
 
-    :param vm: VM object
-    :param start_pos: start position which start to read
-    :type start_pos: int
-    :param start_str: start string
-    :type start_str: int
-    :param end_str: end string
-    :type end_str: str
-    :return: content list and next position
-    :rtype: tuple(list, int)
-    """
-    content = []
-    with open(vm.serial_console_log) as fd:
-        for pos, line in enumerate(fd):
-            if pos >= start_pos:
-                if start_str in line:
-                    content.append(line)
-                elif end_str in line:
-                    content.append(line)
-                    return content, pos + 1
-                elif content:
-                    content.append(line)
+    def run(self):
+        if not os.path.isfile(self.filename):
+            time.sleep(30)
+        try:
+            fd = open(self.filename)
+        except Exception as e:
+            logging.debug("failed to open serial log: %s", str(e))
         else:
-            # Reference variable 'pos' to '-1' if the serial console log is
-            # empty.
-            pos = -1
-    return None, pos + 1
+            content = []
+            while not self._stop_event.is_set():
+                line = fd.readline()
+                if not line:
+                    continue
+                if self.prefix in line or content:
+                    content.append(line)
+                if self.suffix in line:
+                    self.queue.put(list(content))
+                    content.clear()
+        logging.debug("Terminate serial log reader thread.")
+
+    def join(self, timeout=None):
+        self._stop_event.set()
+        super(SerialLogReader, self).join(timeout=timeout)
 
 
-def wait_for_loaded(vm, test, start_pos=0, start_str='SLOF',
-                    end_str='Successfully loaded', timeout=300):
-    """
-    Wait for loading the SLOF.
-
-    :param vm: VM object
-    :param test: kvm test object
-    :param start_pos: start position which start to read
-    :type start_pos: int
-    :param start_str: start string
-    :type start_str: int
-    :param end_str: end string
-    :type end_str: str
-    :param timeout: time out for waiting
-    :type timeout: float
-    :return: content list and next position
-    :rtype: tuple(list, int)
-    """
-    file_timeout = 30
-    if not utils_misc.wait_for(lambda: os.path.isfile(vm.serial_console_log),
-                               file_timeout):
-        test.error('No found serial log in %s sec.' % file_timeout)
-
-    end_time = timeout + time.time()
-    while time.time() < end_time:
-        content, start_pos = get_boot_content(vm, start_pos, start_str, end_str)
-        if content:
-            logging.info('Output of SLOF:\n%s' % ''.join(content))
-            return content, start_pos
-    test.fail(
-        'No found corresponding SLOF info in serial log during %s sec.' %
-        timeout)
+def get_boot_content(timeout=300):
+    pq = [thread.queue for thread in threading.enumerate()
+          if isinstance(thread, SerialLogReader)]
+    start = time.time()
+    while True:
+        can_read, _, _ = select.select(pq, [], [], 0)
+        for r in can_read:
+            start = time.time()
+            item = r.get()
+            logging.debug("Get content from %s:\n%s\n" % (r.name, item))
+            yield item
+        if time.time() > start + timeout:
+            raise TimeoutError("%d timeout in waiting for boot content" %
+                               timeout)
 
 
 def get_booted_devices(content):
