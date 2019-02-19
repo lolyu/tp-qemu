@@ -14,44 +14,84 @@ Available functions:
 
 import re
 import time
-import logging
 import os
+import asyncio
+import logging
 
-from virttest import utils_misc
+from contextlib import suppress
 
 
-def get_boot_content(vm, start_pos=0, start_str='SLOF',
-                     end_str='Successfully loaded'):
-    """
-    Get the specified content of SLOF by reading the serial log.
+kue = asyncio.Queue()
+open_fds = {}
+_loop = None
 
-    :param vm: VM object
-    :param start_pos: start position which start to read
-    :type start_pos: int
-    :param start_str: start string
-    :type start_str: int
-    :param end_str: end string
-    :type end_str: str
-    :return: content list and next position of the end of the content if found
-             the the whole SLOF contents, otherwise return None and the
-             position of start string.
-    :rtype: tuple(list, int)
-    """
-    content = []
-    start_str_pos = 0
-    with open(vm.serial_console_log) as fd:
-        for pos, line in enumerate(fd):
-            if pos >= start_pos:
-                if start_str in line:
-                    start_str_pos = pos
+
+async def get_line(fd):
+    try:
+        return fd.readline()
+    except asyncio.CancelledError:
+        print("GOT CANCELLED")
+
+
+async def content_producer(filename, prefix, suffix):
+    if not os.path.isfile(filename):
+        await asyncio.sleep(30)
+    try:
+        fd = open_fds.setdefault(filename, open(filename))
+    except Exception as e:
+        logging.debug("failed to open serial log: %s", str(e))
+    else:
+        content = []
+        while True:
+            try:
+                await asyncio.sleep(0)
+                line = await get_line(fd)
+                if not line:
+                    continue
+                if prefix in line or content:
                     content.append(line)
-                elif end_str in line:
-                    content.append(line)
-                    return content, pos + 1
-                elif content:
-                    content.append(line)
-        else:
-            return None, start_str_pos
+                if suffix in line:
+                    await kue.put(list(content))
+                    content.clear()
+            except asyncio.CancelledError as e:
+                # task.cancel arranges a CancelledError to be thrown into the
+                # wrapped coroutine on the next cycle.
+                # here we catch the error and clean up.
+                logging.debug("Cancel task for file: %s" % filename)
+                open_fds.pop(filename)
+                fd.close()
+                raise e
+
+
+async def _get_boot_content():
+    content = await kue.get()
+    kue.task_done()
+    return content
+
+
+def get_boot_content(timeout=300):
+    global _loop
+    return _loop.run_until_complete(
+        asyncio.wait_for(_get_boot_content(), timeout))
+
+
+def start_loop(filenames, prefix="SLOF", suffix="Successfully loaded"):
+    global _loop
+    _loop = asyncio.get_event_loop()
+    tasks = [_loop.create_task(content_producer(filename, prefix, suffix))
+             for filename in filenames]
+    return tasks
+
+
+def exit_loop(tasks=None):
+    global _loop
+    if tasks is None:
+        tasks = asyncio.all_tasks(_loop)
+    for task in tasks:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            _loop.run_until_complete(task)
+    _loop.close()
 
 
 def wait_for_loaded(vm, test, start_pos=0, start_str='SLOF',

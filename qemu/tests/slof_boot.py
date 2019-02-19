@@ -84,7 +84,9 @@ def run(test, params, env):
 
     vm = env.get_vm(params['main_vm'])
     vm.verify_alive()
-    content, _ = slof.wait_for_loaded(vm, test)
+    slof.start_loop(vm.serial_console_log)
+
+    content = slof.get_boot_content(timeout=300)
 
     error_context.context("Check the output of SLOF.", logging.info)
     slof.check_error(test, content)
@@ -107,3 +109,4 @@ def run(test, params, env):
 
     session.close()
     vm.destroy(gracefully=True)
+    slof.exit_loop()
